@@ -1,6 +1,6 @@
 {
   "name": "@reallyartificial/body",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Durable action execution for AI agents",
   "keywords": [
     "ai",
@@ -36,6 +36,7 @@
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
     "@types/jest": "^29.5.0",
     "@types/node": "^20.0.0",
     "@typescript-eslint/eslint-plugin": "^6.0.0",
@@ -47,6 +48,7 @@
     "typescript": "^5.0.0"
   },
   "dependencies": {
+    "better-sqlite3": "^9.4.0",
     "zod": "^3.22.0"
   },
   "engines": {
