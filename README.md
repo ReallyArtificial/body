@@ -1,181 +1,156 @@
 # Body
 
-**Durable action execution for AI agents.**
+**A small, durable workflow engine for running agent actions — in TypeScript.**
 
-> "An LLM call is artificial intelligence the way a heartbeat is a person."  
-> — Really Artificial Manifesto
+> Part of the Really Artificial ecosystem.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 ---
 
-## What is Body?
-
-**Body** is the action execution layer for AI systems. It enables agents to take real-world actions — send emails, create files, deploy code, charge payments — **safely, reliably, and with the right constraints**.
-
-Think Temporal/Prefect/Airflow, but designed for LLM-driven workflows instead of batch jobs.
-
-### The Problem
-
-Right now, AI "actions" are fragile:
-
-- **No durable execution** — If the agent crashes mid-action, state is lost
-- **No action history** — What did the agent do? When? Why? Hard to audit
-- **No idempotency** — Same action twice → double-charge, duplicate emails
-- **No dependencies** — Multi-step workflows are duct-taped shell scripts
-- **No visibility** — Agents do things in the background; humans don't know until it breaks
-
-**Result:** Agents are confined to read-only tools or toy demos. Production systems don't trust them.
-
-### The Solution
-
-Body provides:
-
-✅ **Durable workflows** — Survives crashes, retries on failure  
-✅ **Action registry** — Agents discover available actions (MCP-compatible)  
-✅ **Audit log** — Immutable record of every action (who, when, what, why)  
-✅ **Idempotency** — Safe to retry (no duplicate side effects)  
-✅ **Approval integration** — High-risk actions require human approval (via [approvalprotocol](https://github.com/reallyartificial/approvalprotocol))
+> ## Status: early / experimental
+>
+> Body is **~5 days old** (repo created 2026-06-09) and is an **early prototype**, not a finished product.
+> It is roughly 1,300 lines of TypeScript that work today, but:
+>
+> - There are **no automated tests yet** (Jest is configured, but no test files exist).
+> - The API will change without notice. There is no published npm release you should depend on.
+> - It has not been run in production and is not production-ready.
+>
+> Treat it as a working proof of concept you can read, run locally, and build on — not as something to ship behind real side effects yet.
 
 ---
 
-## Quick Start
+## What it actually does today
+
+Body is a single-process workflow engine built on `better-sqlite3` and `zod`. Concretely, the current code gives you:
+
+- **An action registry.** Define an action with a name, a Zod input schema, an `execute` function, and (optionally) a Zod output schema and an `undo` function. Register actions on an engine and look them up by name.
+- **Single-action execution with retry.** `executeAction` runs one action with configurable retries and **exponential backoff** (`retryDelayMs * 2^attempt`).
+- **Sequential multi-step workflows.** `executeWorkflow` runs a list of steps in order. If a step fails after exhausting its retries, the engine performs a **reverse-order rollback**, calling each completed action's `undo` (actions without `undo` are skipped with a warning), and marks the workflow `rolled_back`.
+- **SQLite persistence.** Workflows, per-action execution records (status, retry count, timestamps, inputs/outputs), and the audit log are stored in a SQLite file via `better-sqlite3`.
+- **An HMAC-signed audit log.** Every action outcome is appended to an `audit_log` table with an HMAC-SHA256 signature over the entry. There is a `verifyAuditSignature` method to check an entry against the configured secret, and a `getAuditLog(filters)` query (by workflow, action name, time range, `triggeredBy`, limit).
+
+That's the whole surface area. It is deliberately small.
+
+## What it does NOT do (yet)
+
+To be clear about claims that earlier drafts of this README made but that the code does **not** implement:
+
+- **No Python SDK.** Body is TypeScript only.
+- **No admin UI.** There is no dashboard, web view, or visual audit browser.
+- **No `npx body-init` wizard.** There is no scaffolding CLI. You install the package and write code.
+- **No MCP integration / action discovery over MCP.** The registry is an in-process `Map`, not an MCP surface.
+- **No approvalprotocol integration.** `requiresApproval` exists as a field on the Action interface and `WorkflowConfig`, but nothing enforces or wires up approvals yet.
+- **No scheduling, no parallel execution, no distributed execution, no policy engine.**
+- **No automatic passing of one step's output into the next step's inputs.** Steps are independent; if a later step needs an earlier step's result, you don't get it automatically yet.
+
+## Install
 
 ```bash
-npx body-init
+npm install @reallyartificial/body
+# peer/runtime deps used by the engine:
+#   better-sqlite3, zod
 ```
 
-This wizard creates:
-- A new Body project
-- Example actions (send_email, create_file, http_request)
-- Admin UI (view workflows, audit log)
-- Integration with approvalprotocol (optional)
+Requires Node.js >= 18. (Note: there is no published, stable release yet — see the status banner above. To try it now, clone the repo and run the example below.)
 
-Then:
+## Usage
+
+The real entry point is the `WorkflowEngine` class plus `defineAction`. Here is a minimal, accurate example:
 
 ```typescript
-import { defineAction, createWorkflow } from '@reallyartificial/body';
+import { z } from 'zod';
+import { defineAction, WorkflowEngine } from '@reallyartificial/body';
 
-// Define an action
+// 1. Define an action. inputs/outputs are Zod schemas.
 const sendEmail = defineAction({
   name: 'send_email',
-  inputs: { to: 'string', subject: 'string', body: 'string' },
+  description: 'Send an email',
+  inputs: z.object({
+    to: z.string().email(),
+    subject: z.string(),
+    body: z.string(),
+  }),
+  outputs: z.object({ messageId: z.string() }),
   execute: async ({ to, subject, body }) => {
-    await smtp.send({ to, subject, body });
-    return { messageId: '...' };
+    // ...send the email...
+    return { messageId: `msg-${Date.now()}` };
   },
+  // Optional: used during rollback if a later step fails.
   undo: async ({ messageId }) => {
-    // Can't unsend, but can send a retraction
-    await smtp.send({ to, subject: 'RETRACTION', body: '...' });
+    // ...send a retraction, cancel, etc...
   },
 });
 
-// Create a workflow
-const emailWorkflow = createWorkflow({
-  name: 'send_welcome_email',
-  steps: [sendEmail],
-});
+// 2. Create an engine (SQLite file path; optional HMAC secret for the audit log).
+const engine = new WorkflowEngine('./body.db', process.env.BODY_AUDIT_SECRET);
+engine.registerAction(sendEmail);
 
-// Execute
-await emailWorkflow.run({ to: 'user@example.com', subject: 'Welcome!', body: '...' });
+// 3a. Run a single action (retries with exponential backoff).
+const result = await engine.executeAction(
+  'send_email',
+  { to: 'user@example.com', subject: 'Hi', body: 'Hello!' },
+  { maxRetries: 3, retryDelayMs: 500 }
+);
+console.log(result.success, result.workflowId, result.output);
+
+// 3b. Or run a sequential, rollback-on-failure workflow.
+const wf = await engine.executeWorkflow(
+  'welcome_flow',
+  [
+    { action: 'send_email', inputs: { to: 'user@example.com', subject: 'Hi', body: 'Hello!' } },
+    // ...more steps...
+  ],
+  { maxRetries: 3, retryDelayMs: 500 }
+);
+console.log(wf.success, wf.results);
+
+// 4. Inspect state and the signed audit log.
+console.log(engine.getWorkflow(wf.workflowId));
+console.log(engine.getAuditLog({ limit: 10 }));
+
+engine.close();
 ```
 
----
+A fuller, runnable version (multiple actions, a deliberately flaky step that triggers rollback, audit-log querying) lives in [`examples/email-workflow.ts`](examples/email-workflow.ts):
 
-## Architecture
+```bash
+npx ts-node examples/email-workflow.ts
+```
 
-Body has four core primitives:
+### Audit secret
 
-### 1. **Action**
-A unit of work: "send email", "deploy commit abc123", "charge $50.00".
+The audit log is signed with HMAC-SHA256. The secret is taken from the `WorkflowEngine` constructor argument, then `process.env.BODY_AUDIT_SECRET`, and otherwise falls back to a hard-coded development default. **Set your own secret** (constructor or `BODY_AUDIT_SECRET`) if signatures need to mean anything — the default is not secret.
 
-- Has inputs, outputs, side effects
-- Idempotent (safe to retry)
-- Rollback-aware (can undo if something goes wrong)
+## API surface
 
-### 2. **Workflow**
-A sequence of actions with dependencies: "A → B → C, but if B fails, rollback A".
+Exported from the package root:
 
-- Handles retries, timeouts, conditional logic
-- Survives agent crashes (durable state)
-- Visibility into what's running, what's done, what failed
+- `defineAction(definition)` — validates and returns an `Action`.
+- `WorkflowEngine` — `registerAction`, `listActions`, `getAction`, `executeAction`, `executeWorkflow`, `getWorkflow`, `getAuditLog`, `close`.
+- `WorkflowDatabase` — the SQLite layer (used internally by the engine; also exported).
+- `httpRequest` — a sample built-in action.
+- Types: `Action`, `ActionResult`, `ActionContext`, `Workflow`, `WorkflowAction`, `WorkflowStatus`, `ActionStatus`, `AuditLogEntry`, `WorkflowConfig`.
 
-### 3. **Action Registry**
-Agents discover available actions (like MCP tools, but for execution).
+## Roadmap (aspirational, not built)
 
-- Schema for inputs/outputs
-- Constraints (who can run this? when? with what approval?)
-- Examples + test cases (via [mcp-jest](https://github.com/reallyartificial/mcp-jest))
+Near-term things that would make this more useful, roughly in priority order:
 
-### 4. **Audit Log**
-Every action is recorded: who triggered it, when, what inputs, what outputs, what changed.
+- Tests for the engine (retry counting, rollback ordering, audit signature verification).
+- Pass prior step outputs into later step inputs in `executeWorkflow`.
+- Real approval enforcement (wiring `requiresApproval` to something).
 
-- Immutable log (append-only)
-- Queryable (show me all actions by agent X in the last 24h)
-- Tamper-proof (signed, hashed)
-
----
-
-## Roadmap
-
-### v0.1 (8 weeks) — Email Workflow MVP
-- Action SDK (TypeScript + Python)
-- SQLite-backed workflow engine
-- Action registry (MCP-compatible)
-- Audit log
-- Admin UI
-- Integration with [approvalprotocol](https://github.com/reallyartificial/approvalprotocol)
-
-### v0.2 (16 weeks) — Production Features
-- Scheduled actions (cron-like)
-- Conditional workflows
-- Parallel execution
-- Action plugins (community-contributed)
-- Observability (metrics, alerts)
-
-### v1.0 (6 months) — Production-Ready
-- Distributed execution (scale horizontally)
-- Rollback workflows (auto-undo on failure)
-- Policy engine (time-based, role-based access)
-- Compliance & audit (SOC 2 / GDPR-ready)
-- Cloud provider integrations (AWS, GCP, Azure)
-
----
-
-## Related Projects
-
-Body is part of the **Really Artificial** ecosystem:
-
-- **[Brain (freeport)](https://github.com/reallyartificial/freeport)** — LLM routing & fallback
-- **[Memory (engram)](https://github.com/reallyartificial/engram)** — Context persistence
-- **[Nerves (mcp-jest)](https://github.com/reallyartificial/mcp-jest)** — Testing framework for MCP servers
-- **[Soul (approvalprotocol)](https://github.com/reallyartificial/approvalprotocol)** — Human-in-the-loop approval
-
-Together, they form the infrastructure for AI systems that **remember, act, recover, and know when to ask a human**.
-
----
+Anything beyond that (scheduling, parallelism, distribution, a UI, other language SDKs) is an idea, not a commitment.
 
 ## Contributing
 
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for:
-- How to set up your dev environment
-- Where to find good first issues
-- Code style and testing guidelines
-
----
+It's very early. If you want to poke at it, the most valuable contribution right now is tests for the existing engine behavior. See [CONTRIBUTING.md](CONTRIBUTING.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## License
 
-MIT — See [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).
 
 ---
 
-## Status
-
-⚠️ **Early development** — v0.1 shipping end of July 2026.  
-Not production-ready yet. Watch this repo for updates!
-
----
-
-Built by [Really Artificial](https://reallyartificial.org) · [Manifesto](https://github.com/reallyartificial/manifesto)
+Built by [Really Artificial](https://reallyartificial.org).
